@@ -1,6 +1,7 @@
 // Package netns hosts test instances in nested Linux namespaces, joined
 // to the test's own network namespace by a veth pair. It needs nothing
-// beyond unprivileged user namespaces and iproute2 on $PATH: no root.
+// beyond unprivileged user namespaces: no root, and no tools on $PATH,
+// since links are configured over rtnetlink.
 //
 // A test binary using the rig wears three hats, told apart by
 // environment markers which Main reads:
@@ -21,8 +22,13 @@
 // and subnets derived from each instance; when those exist, the lock is
 // deleted and nothing else changes.
 //
+// LinkUp and LinkDown set a link up or down in the caller's network
+// namespace, such as the host end of an instance's veth pair, so a test
+// can take the link away from the instance and give it back.
+//
 // The rig runs on Linux only. On other platforms Main runs the tests in
-// place without Setup, and Start skips.
+// place without Setup, Start skips, and LinkUp and LinkDown return an
+// error.
 package netns
 
 import (

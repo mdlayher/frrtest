@@ -4,6 +4,7 @@ package netns_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,12 +38,21 @@ const (
 // daemon: see probeMain.
 const probeArg = "netns-probe"
 
+// listenArg, as the test binary's first argument, makes it a listening
+// daemon: see listenMain.
+const listenArg = "netns-listen"
+
 // timeout bounds every wait on an instance.
 const timeout = time.Minute
 
 func TestMain(m *testing.M) {
-	if len(os.Args) > 2 && os.Args[1] == probeArg {
-		probeMain(os.Args[2]) // never returns
+	if len(os.Args) > 2 {
+		switch os.Args[1] {
+		case probeArg:
+			probeMain(os.Args[2]) // never returns
+		case listenArg:
+			listenMain(os.Args[2]) // never returns
+		}
 	}
 
 	netns.Main(m, netns.MainConfig{})
@@ -296,6 +306,111 @@ func TestStartInitFails(t *testing.T) {
 	})
 }
 
+// TestLinkUpDown proves LinkDown takes the host end of the pair down,
+// cutting the test off from a listener inside the instance, and LinkUp
+// brings it back with both of its addresses still on it.
+func TestLinkUpDown(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("failed to find the test binary: %v", err)
+	}
+
+	veth := testVeth()
+	report := net.JoinHostPort(
+		veth.HostAddrs[0].Addr().String(),
+		strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
+	)
+
+	netns.Start(t, netns.InstanceConfig{
+		Dir:  t.TempDir(),
+		Veth: veth,
+		Daemons: []netns.Daemon{{
+			Name: "listen",
+			Path: exe,
+			Args: []string{listenArg, report},
+		}},
+	})
+
+	addr := net.JoinHostPort(veth.PeerAddrs[0].Addr().String(), string(accept(t, ln)))
+
+	dial := func() error {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+
+		var d net.Dialer
+		c, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return err
+		}
+
+		return c.Close()
+	}
+
+	up := func() bool {
+		ifi, err := net.InterfaceByName(hostVeth)
+		if err != nil {
+			t.Fatalf("failed to find %s: %v", hostVeth, err)
+		}
+
+		return ifi.Flags&net.FlagUp != 0
+	}
+
+	if err := dial(); err != nil {
+		t.Fatalf("failed to reach the instance before LinkDown: %v", err)
+	}
+
+	if err := netns.LinkDown(hostVeth); err != nil {
+		t.Fatalf("failed to set %s down: %v", hostVeth, err)
+	}
+
+	if up() {
+		t.Errorf("%s is still up after LinkDown", hostVeth)
+	}
+
+	// Down takes the connected route with it, so the dial fails at once
+	// rather than timing out.
+	if err := dial(); !errors.Is(err, syscall.ENETUNREACH) {
+		t.Errorf("unexpected dial error with %s down: %v", hostVeth, err)
+	}
+
+	if err := netns.LinkUp(hostVeth); err != nil {
+		t.Fatalf("failed to set %s up: %v", hostVeth, err)
+	}
+
+	if !up() {
+		t.Errorf("%s is still down after LinkUp", hostVeth)
+	}
+
+	if err := dial(); err != nil {
+		t.Errorf("failed to reach the instance after LinkUp: %v", err)
+	}
+
+	// The bounce flushed nothing: Start keeps the host end's IPv6
+	// addresses across link down.
+	ifi, err := net.InterfaceByName(hostVeth)
+	if err != nil {
+		t.Fatalf("failed to find %s: %v", hostVeth, err)
+	}
+
+	addrs, err := globalAddrs(ifi)
+	if err != nil {
+		t.Fatalf("failed to list %s addresses: %v", hostVeth, err)
+	}
+
+	if diff := cmp.Diff([]string{"192.0.2.1/24", "2001:db8::1/64"}, addrs); diff != "" {
+		t.Errorf("unexpected %s addresses after LinkUp (-want +got):\n%s", hostVeth, diff)
+	}
+}
+
 // testVeth returns the harness network's veth pair.
 func testVeth() netns.Veth {
 	return netns.Veth{
@@ -446,6 +561,41 @@ func probeMain(arg string) {
 	// The instance's teardown kills the probe, with SIGKILL, so there
 	// is nothing to wait for but that.
 	select {}
+}
+
+// listenMain is the test binary as a listening daemon: it listens on a
+// port of its own, sends the port to the test at dial, and then accepts
+// and closes connections until it is killed. It never returns.
+func listenMain(dial string) {
+	fail := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "listen: "+format+"\n", args...)
+		os.Exit(1)
+	}
+
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		fail("listening: %v", err)
+	}
+
+	c, err := net.DialTimeout("tcp", dial, timeout)
+	if err != nil {
+		fail("dialing %s: %v", dial, err)
+	}
+
+	if _, err := fmt.Fprintf(c, "%d\n", ln.Addr().(*net.TCPAddr).Port); err != nil {
+		fail("reporting: %v", err)
+	}
+
+	_ = c.Close()
+
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			fail("accepting: %v", err)
+		}
+
+		_ = c.Close()
+	}
 }
 
 // A fatalTB is a testing.TB whose Fatal records the failure and ends

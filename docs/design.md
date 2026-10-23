@@ -137,6 +137,17 @@ type Instance struct{ ... }
 
 // Logs returns every daemon's log and the init's, each under a header.
 func (i *Instance) Logs() []byte
+
+// LinkUp sets the link named name administratively up in the caller's
+// network namespace.
+func LinkUp(name string) error
+
+// LinkDown sets the link named name administratively down in the
+// caller's network namespace. The kernel flushes a link's IPv6
+// addresses as it goes down unless its keep_addr_on_down is set, which
+// Start sets on the host end of an instance's pair, so that end keeps
+// its addresses across a down and up.
+func LinkDown(name string) error
 ```
 
 The three hats stay, told apart by fixed environment markers
@@ -160,8 +171,27 @@ and raises its end, moves the peer into the init's namespace by pid, and
 sends `veth`. The init addresses and raises the peer, starts the daemons,
 prints `up`, and waits for stdin to close. Closing stdin is teardown: the
 init kills the daemons and exits, dissolving the namespaces and the pair
-with them. A ten second kill timer and an explicit `ip link del` of the
-host end are backstops.
+with them. A ten second kill timer and an explicit delete of the host
+end are backstops.
+
+Every link operation goes over rtnetlink, through
+`github.com/jsimonetti/rtnetlink/v2` on `github.com/mdlayher/netlink`, so
+nothing needs iproute2 or `$PATH`. Each operation dials its own
+connection and closes it, and the package holds no state. Both ends'
+IPv6 addresses carry `IFA_F_NODAD`, and the peer moves by
+`IFLA_NET_NS_PID`. `accept_ra=0` is still written through `/proc/sys`.
+
+`LinkUp` and `LinkDown` set a link up or down in the caller's network
+namespace. For a test that is the host end, which is enough to take the
+link away from the instance: the peer loses carrier, and a packet socket
+on the host end survives a down and up. So do the host end's addresses:
+`Start` sets `keep_addr_on_down=1` on it beside `accept_ra=0`, since the
+kernel otherwise flushes a link's IPv6 addresses as it goes down and the
+harness network is statically addressed. `Start`, the child, and the init
+raise their own links through `LinkUp`. They return errors rather than
+taking a `testing.TB`, so a test may call them off its own goroutine.
+Reaching the peer end inside the instance's namespace would extend the
+init's stdin protocol, and no consumer needs it yet.
 
 ### The lock
 
@@ -369,13 +399,13 @@ on the exit.
 Each of these has a reason in the sources which the code alone does not
 show. The implementer keeps each one with its comment:
 
-- `ip` resolved through `EvalSymlinks` in the init before the tmpfs over
-  `/run`, since NixOS `$PATH` entries resolve through it.
 - `runtime.LockOSThread` in the init, so `Pdeathsig` watches a thread
   which lives as long as the process.
-- `nodad` on every IPv6 address add.
+- `IFA_F_NODAD` on every IPv6 address add.
 - `accept_ra=0` written while the host link is still down, before any
   advertisement can arrive.
+- `keep_addr_on_down=1` on the host end, so `LinkDown` leaves its IPv6
+  addresses in place.
 - The group file with `frrvty:x:0:` appended.
 - The run directory under `/tmp`, not `t.TempDir()`.
 - `os.Args[1:]` passed to the re-executed child so `-test.run`,
@@ -419,3 +449,7 @@ later date is given:
   returns an error wrapping `ctx.Err()` and fn's last error instead of
   failing a `testing.TB`, and `Oracle.Timeout` and `DefaultTimeout`
   are gone. fn returns an error, and polling stops when it returns nil.
+- On 2026-10-23: link setup goes through netlink, and iproute2 is no
+  longer needed at runtime. `netns` exports `LinkUp` and `LinkDown`,
+  which act in the caller's network namespace. Control of the peer end
+  inside the instance is deferred until a consumer needs it.

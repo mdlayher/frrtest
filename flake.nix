@@ -25,12 +25,11 @@
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             # The module's own tests, for development and CI only:
             # frr on $PATH puts vtysh where the oracle discovers the
-            # daemons, and iproute2 wires the veth pair. This is not a
-            # pin. The oracle's tests read the version they enforce
-            # from this FRR's zebra, so a flake update moves it without
-            # touching Go; consumers pin their own FRR.
+            # daemons. This is not a pin. The oracle's tests read the
+            # version they enforce from this FRR's zebra, so a flake
+            # update moves it without touching Go; consumers pin their
+            # own FRR.
             pkgs.frr
-            pkgs.iproute2
           ];
         };
       });

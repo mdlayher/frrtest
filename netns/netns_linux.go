@@ -8,16 +8,19 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jsimonetti/rtnetlink/v2"
+	"github.com/jsimonetti/rtnetlink/v2/driver"
 )
 
 // Environment markers wiring the rig's re-executions. They are
@@ -89,8 +92,8 @@ func reexec() int {
 func child(m *testing.M) int {
 	// The re-exec landed in an empty network namespace; even loopback
 	// starts down.
-	if out, err := exec.Command("ip", "link", "set", "lo", "up").CombinedOutput(); err != nil {
-		log.Printf("netns: failed to bring up loopback: %v: %s", err, out)
+	if err := LinkUp("lo"); err != nil {
+		log.Print(err)
 		return 1
 	}
 
@@ -184,7 +187,7 @@ func Start(tb testing.TB, cfg InstanceConfig) *Instance {
 		timer := time.AfterFunc(10*time.Second, func() { _ = initCmd.Process.Kill() })
 		_ = initCmd.Wait()
 		timer.Stop()
-		_ = exec.Command("ip", "link", "del", cfg.Veth.Host).Run()
+		_ = linkDelete(cfg.Veth.Host)
 	})
 
 	if err := json.NewEncoder(stdin).Encode(cfg); err != nil {
@@ -205,20 +208,17 @@ func Start(tb testing.TB, cfg InstanceConfig) *Instance {
 		}
 	}
 
-	ipCmd := func(args ...string) {
-		tb.Helper()
-
-		if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
-			tb.Fatalf("failed to run ip %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-	}
-
 	// The handoff: once init's namespaces exist, build the veth pair
 	// here, push one end into them, and let init take it from there.
 	expect("ready")
-	ipCmd("link", "add", cfg.Veth.Host, "type", "veth", "peer", "name", cfg.Veth.Peer)
+	if err := vethAdd(cfg.Veth.Host, cfg.Veth.Peer); err != nil {
+		tb.Fatal(err)
+	}
+
 	for _, p := range cfg.Veth.HostAddrs {
-		ipCmd(addrAdd(cfg.Veth.Host, p)...)
+		if err := addrAdd(cfg.Veth.Host, p); err != nil {
+			tb.Fatal(err)
+		}
 	}
 
 	// The harness network is statically addressed, so this side must
@@ -235,8 +235,22 @@ func Start(tb testing.TB, cfg InstanceConfig) *Instance {
 		tb.Fatalf("failed to disable IPv6 router advertisements on %s: %v", cfg.Veth.Host, err)
 	}
 
-	ipCmd("link", "set", cfg.Veth.Host, "up")
-	ipCmd("link", "set", cfg.Veth.Peer, "netns", strconv.Itoa(initCmd.Process.Pid))
+	// The harness network is statically addressed on both ends, and a
+	// LinkDown must not change that: by default the kernel flushes a
+	// link's IPv6 addresses as it goes down, which would leave the host
+	// end with only its IPv4 address after a bounce.
+	if err := os.WriteFile(filepath.Join("/proc/sys/net/ipv6/conf", cfg.Veth.Host, "keep_addr_on_down"), []byte("1\n"), 0o644); err != nil {
+		tb.Fatalf("failed to keep IPv6 addresses on %s across link down: %v", cfg.Veth.Host, err)
+	}
+
+	if err := LinkUp(cfg.Veth.Host); err != nil {
+		tb.Fatal(err)
+	}
+
+	if err := linkSetNS(cfg.Veth.Peer, initCmd.Process.Pid); err != nil {
+		tb.Fatal(err)
+	}
+
 	if _, err := fmt.Fprintln(stdin, "veth"); err != nil {
 		tb.Fatalf("failed to hand init the veth peer: %v", err)
 	}
@@ -274,16 +288,148 @@ func lock(tb testing.TB) {
 	})
 }
 
-// addrAdd returns the ip arguments assigning p to dev. IPv6 addresses
-// skip duplicate address detection, which would otherwise hold each one
-// tentative, and unusable, for a while after the link comes up: the
-// pair has only two ends, and their addresses are fixed.
-func addrAdd(dev string, p netip.Prefix) []string {
-	if p.Addr().Is4() {
-		return []string{"addr", "add", p.String(), "dev", dev}
+// LinkUp sets the link named name administratively up in the caller's
+// network namespace.
+func LinkUp(name string) error {
+	if err := linkSetFlags(name, syscall.IFF_UP); err != nil {
+		return fmt.Errorf("netns: failed to set %s up: %w", name, err)
 	}
 
-	return []string{"-6", "addr", "add", p.String(), "dev", dev, "nodad"}
+	return nil
+}
+
+// LinkDown sets the link named name administratively down in the
+// caller's network namespace. The kernel flushes a link's IPv6
+// addresses as it goes down unless its keep_addr_on_down is set, which
+// Start sets on the host end of an instance's pair, so that end keeps
+// its addresses across a down and up.
+func LinkDown(name string) error {
+	if err := linkSetFlags(name, 0); err != nil {
+		return fmt.Errorf("netns: failed to set %s down: %w", name, err)
+	}
+
+	return nil
+}
+
+// linkSetFlags sets the IFF_UP bit of the link named name to the one in
+// flags, leaving its other flags alone.
+func linkSetFlags(name string, flags uint32) error {
+	return withLink(name, func(c *rtnetlink.Conn, index uint32) error {
+		return c.Link.Set(&rtnetlink.LinkMessage{
+			Index:  index,
+			Flags:  flags,
+			Change: syscall.IFF_UP,
+		})
+	})
+}
+
+// vethAdd creates the veth pair host and peer in the caller's network
+// namespace, both ends down.
+func vethAdd(host, peer string) error {
+	c, err := rtnetlink.Dial(nil)
+	if err != nil {
+		return fmt.Errorf("netns: failed to dial rtnetlink: %w", err)
+	}
+
+	defer c.Close()
+
+	err = c.Link.New(&rtnetlink.LinkMessage{
+		Attributes: &rtnetlink.LinkAttributes{
+			Name: host,
+			Info: &rtnetlink.LinkInfo{
+				Kind: "veth",
+				Data: &driver.Veth{
+					PeerInfo: &rtnetlink.LinkMessage{
+						Attributes: &rtnetlink.LinkAttributes{Name: peer},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("netns: failed to create veth pair %s and %s: %w", host, peer, err)
+	}
+
+	return nil
+}
+
+// addrAdd assigns p to the link named dev. IPv6 addresses skip
+// duplicate address detection, which would otherwise hold each one
+// tentative, and unusable, for a while after the link comes up: the
+// pair has only two ends, and their addresses are fixed.
+func addrAdd(dev string, p netip.Prefix) error {
+	family, flags := uint8(syscall.AF_INET), uint32(0)
+	if p.Addr().Is6() {
+		family, flags = syscall.AF_INET6, syscall.IFA_F_NODAD
+	}
+
+	err := withLink(dev, func(c *rtnetlink.Conn, index uint32) error {
+		return c.Address.New(&rtnetlink.AddressMessage{
+			Family:       family,
+			PrefixLength: uint8(p.Bits()),
+			Scope:        syscall.RT_SCOPE_UNIVERSE,
+			Index:        index,
+			Attributes: &rtnetlink.AddressAttributes{
+				Address: p.Addr().AsSlice(),
+				Local:   p.Addr().AsSlice(),
+				Flags:   flags,
+			},
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("netns: failed to add %s to %s: %w", p, dev, err)
+	}
+
+	return nil
+}
+
+// linkSetNS moves the link named name into the network namespace of the
+// process pid.
+func linkSetNS(name string, pid int) error {
+	err := withLink(name, func(c *rtnetlink.Conn, index uint32) error {
+		return c.Link.Set(&rtnetlink.LinkMessage{
+			Index: index,
+			Attributes: &rtnetlink.LinkAttributes{
+				NetNS: rtnetlink.NetNSForPID(uint32(pid)),
+			},
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("netns: failed to move %s to the namespace of pid %d: %w", name, pid, err)
+	}
+
+	return nil
+}
+
+// linkDelete deletes the link named name.
+func linkDelete(name string) error {
+	err := withLink(name, func(c *rtnetlink.Conn, index uint32) error {
+		return c.Link.Delete(index)
+	})
+	if err != nil {
+		return fmt.Errorf("netns: failed to delete %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// withLink calls fn with a fresh rtnetlink connection, closed when fn
+// returns, and the index of the link named name in the caller's network
+// namespace.
+func withLink(name string, fn func(c *rtnetlink.Conn, index uint32) error) error {
+	ifi, err := net.InterfaceByName(name)
+	if err != nil {
+		return err
+	}
+
+	c, err := rtnetlink.Dial(nil)
+	if err != nil {
+		return err
+	}
+
+	defer c.Close()
+
+	return fn(c, uint32(ifi.Index))
 }
 
 // initMain is hat three: a tiny init holding the namespaces of one
@@ -309,23 +455,6 @@ func initMain() {
 		fail("decoding config: %v", err)
 	}
 
-	// Resolve iproute2 before the mounts below: masking /run breaks
-	// $PATH lookups on distros such as NixOS, whose entries resolve
-	// through it.
-	ipBin, err := exec.LookPath("ip")
-	if err == nil {
-		ipBin, err = filepath.EvalSymlinks(ipBin)
-	}
-	if err != nil {
-		fail("iproute2 unavailable: %v", err)
-	}
-
-	ipCmd := func(args ...string) {
-		if out, err := exec.Command(ipBin, args...).CombinedOutput(); err != nil {
-			fail("ip %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-	}
-
 	if cfg.Hostname != "" {
 		if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
 			fail("sethostname: %v", err)
@@ -338,6 +467,7 @@ func initMain() {
 	}
 
 	for _, m := range cfg.Mounts {
+		var err error
 		switch m.Type {
 		case "tmpfs":
 			err = syscall.Mount("tmpfs", m.Target, "tmpfs", 0, "")
@@ -357,7 +487,9 @@ func initMain() {
 		}
 	}
 
-	ipCmd("link", "set", "lo", "up")
+	if err := LinkUp("lo"); err != nil {
+		fail("%v", err)
+	}
 
 	// Hat two hands the veth peer over once we are visible.
 	fmt.Println("ready")
@@ -366,10 +498,14 @@ func initMain() {
 	}
 
 	for _, p := range cfg.Veth.PeerAddrs {
-		ipCmd(addrAdd(cfg.Veth.Peer, p)...)
+		if err := addrAdd(cfg.Veth.Peer, p); err != nil {
+			fail("%v", err)
+		}
 	}
 
-	ipCmd("link", "set", cfg.Veth.Peer, "up")
+	if err := LinkUp(cfg.Veth.Peer); err != nil {
+		fail("%v", err)
+	}
 
 	var daemons []*exec.Cmd
 	for _, d := range cfg.Daemons {

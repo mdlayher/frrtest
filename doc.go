@@ -38,8 +38,8 @@
 //
 // $<EnvPrefix>_FRR names the daemon directory, such as /usr/lib/frr or a
 // Nix store path's libexec/frr. Without it, Main looks in the usual
-// install locations and beside vtysh on $PATH. iproute2 must be on
-// $PATH. A missing or mismatched FRR is a hard failure, never a skip.
+// install locations and beside vtysh on $PATH. A missing or mismatched
+// FRR is a hard failure, never a skip.
 //
 // When $<EnvPrefix>_LOGDIR is set, each instance's logs are saved there
 // on teardown; a failed test additionally logs them.

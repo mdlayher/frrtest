@@ -17,10 +17,20 @@
 // Each test then starts an instance from its own rendered configuration,
 // waits for the protocol, and drives the instance through vtysh:
 //
-//	f := oracle.Start(t, oracle.Render(t, "testdata/frr.conf.tmpl", cfg))
-//	f.Poll(t, "isisd never answered vtysh", func() bool {
-//		return f.JSON(t, "show isis summary json", nil) == nil
-//	})
+//	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+//	defer cancel()
+//
+//	f := oracle.Start(ctx, t, oracle.Render(t, "testdata/frr.conf.tmpl", cfg))
+//	if err := f.Poll(ctx, func() error {
+//		return f.JSON(t, "show isis summary json", nil)
+//	}); err != nil {
+//		t.Fatalf("isisd never answered vtysh: %v", err)
+//	}
+//
+// The caller's context bounds every wait: Start's for the daemons, and
+// each Poll's for its condition. A poll whose context ends returns an
+// error wrapping ctx.Err() and the condition's last error, and the
+// caller says what failed.
 //
 // The instance runs the daemons on the far end of a veth pair whose near
 // end is in the test's own network namespace, so code under test speaks

@@ -4,6 +4,7 @@ package frrtest
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -88,6 +90,86 @@ func TestInstanceConfigure(t *testing.T) {
 	err := i.JSON(t, "show no such thing json", nil)
 	if err == nil || !strings.Contains(err.Error(), "Unknown command") {
 		t.Errorf("unexpected error for an unknown command: %v", err)
+	}
+}
+
+// TestPoll proves a condition which already holds returns without
+// waiting, even on a context which has ended, and a poll whose context
+// ends returns an error wrapping both the context's and fn's last.
+func TestPoll(t *testing.T) {
+	t.Parallel()
+
+	// A deadline already past ends the context before the first tick, so
+	// neither case waits.
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now())
+	t.Cleanup(cancel)
+
+	errNotYet := errors.New("not yet")
+
+	tests := []struct {
+		name string
+		fn   error
+		want []error
+	}{
+		{
+			name: "holds",
+		},
+		{
+			name: "deadline",
+			fn:   errNotYet,
+			want: []error{context.DeadlineExceeded, errNotYet},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var calls int
+			err := Poll(ctx, func() error {
+				calls++
+				return tt.fn
+			})
+
+			if (err == nil) != (tt.want == nil) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			for _, want := range tt.want {
+				if !errors.Is(err, want) {
+					t.Errorf("the error does not wrap %v: %v", want, err)
+				}
+			}
+
+			if calls != 1 {
+				t.Errorf("unexpected calls to fn: got %d, want 1", calls)
+			}
+		})
+	}
+}
+
+// TestInstancePoll proves an instance's poll which never succeeds ends
+// with its context, in an error which names the instance and wraps the
+// context's.
+func TestInstancePoll(t *testing.T) {
+	t.Parallel()
+
+	i := startTest(t, testOracle())
+
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now())
+	t.Cleanup(cancel)
+
+	err := i.Poll(ctx, func() error {
+		_, err := i.Vtysh("show no such thing")
+		return err
+	})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the poll must end with its context, but got: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), i.Name()) {
+		t.Errorf("the error does not name %s: %v", i.Name(), err)
 	}
 }
 
@@ -170,11 +252,15 @@ type testConfig struct {
 }
 
 // startTest starts an instance of o whose interface on the harness
-// network carries the description "rendered".
+// network carries the description "rendered", allowing a minute for its
+// daemons to come up.
 func startTest(t *testing.T, o Oracle) *Instance {
 	t.Helper()
 
-	return o.Start(t, o.Render(t, filepath.Join("testdata", "frr.conf.tmpl"), testConfig{
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+
+	return o.Start(ctx, t, o.Render(t, filepath.Join("testdata", "frr.conf.tmpl"), testConfig{
 		Interface:   o.Peer,
 		Description: "rendered",
 	}))

@@ -3,6 +3,7 @@ package frrtest
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,14 +21,9 @@ import (
 	"github.com/mdlayher/frrtest/netns"
 )
 
-const (
-	// DefaultHostname is an instance's kernel hostname when
-	// Oracle.Hostname is empty.
-	DefaultHostname = "frr-interop"
-
-	// DefaultTimeout bounds every poll when Oracle.Timeout is zero.
-	DefaultTimeout = 60 * time.Second
-)
+// DefaultHostname is an instance's kernel hostname when Oracle.Hostname
+// is empty.
+const DefaultHostname = "frr-interop"
 
 // Addresses are the addresses on each end of the harness network: Host
 // on the end in the test's namespace and Peer on the instance's.
@@ -86,9 +82,6 @@ type Oracle struct {
 	// Hostname is the instance's kernel hostname, DefaultHostname when
 	// empty.
 	Hostname string
-
-	// Timeout bounds every poll, DefaultTimeout when zero.
-	Timeout time.Duration
 }
 
 // Main is the whole body of a consumer's TestMain. It never returns.
@@ -164,12 +157,13 @@ func (o Oracle) setup() error {
 // torn down when tb ends. conf is the instance's whole frr.conf; the
 // harness supplies vtysh.conf itself. It returns once every daemon
 // accepts configuration through vtysh; protocol readiness is the
-// caller's poll.
+// caller's poll. ctx bounds the wait for every daemon's vty socket
+// before the configuration load.
 //
 // Instances run one at a time, and a test may host only one: see
 // netns.Start. When $<EnvPrefix>_LOGDIR is set, the instance's logs are
 // saved there on teardown, and a failed test also logs them.
-func (o Oracle) Start(tb testing.TB, conf []byte) *Instance {
+func (o Oracle) Start(ctx context.Context, tb testing.TB, conf []byte) *Instance {
 	tb.Helper()
 
 	if runtime.GOOS != "linux" {
@@ -281,15 +275,17 @@ func (o Oracle) Start(tb testing.TB, conf []byte) *Instance {
 
 	// The config load below needs every daemon's vty socket, which each
 	// binds asynchronously after starting.
-	i.Poll(tb, "vty sockets never appeared", func() bool {
+	if err := i.Poll(ctx, func() error {
 		for _, d := range o.Daemons {
 			if _, err := os.Stat(filepath.Join(run, d+".vty")); err != nil {
-				return false
+				return err
 			}
 		}
 
-		return true
-	})
+		return nil
+	}); err != nil {
+		tb.Fatalf("vty sockets never appeared: %v", err)
+	}
 
 	// Load the integrated configuration now that every daemon is
 	// listening.
@@ -424,28 +420,49 @@ func (i *Instance) Configure(tb testing.TB, lines ...string) {
 	}
 }
 
-// Poll waits for a condition of the instance within the oracle's
-// timeout, naming the instance on failure.
-func (i *Instance) Poll(tb testing.TB, msg string, fn func() bool) {
-	tb.Helper()
+// Poll is Poll naming the instance in the error.
+func (i *Instance) Poll(ctx context.Context, fn func() error) error {
+	if err := poll(ctx, fn); err != nil {
+		return fmt.Errorf("frrtest: %s: %w", i.name, err)
+	}
 
-	Poll(tb, cmp.Or(i.o.Timeout, DefaultTimeout), i.name+": "+msg, fn)
+	return nil
 }
 
-// Poll invokes fn every 250ms until it reports true, failing tb after
-// timeout. Polling an external process or the kernel is the documented
+// Poll invokes fn every 250ms until it returns nil, or until ctx ends,
+// which is the failure: the returned error wraps ctx.Err() and fn's last
+// error. Polling an external process or the kernel is the documented
 // exception to the no-sleep rule: neither state machine is ours to
 // synchronize on.
-func Poll(tb testing.TB, timeout time.Duration, msg string, fn func() bool) {
-	tb.Helper()
+func Poll(ctx context.Context, fn func() error) error {
+	if err := poll(ctx, fn); err != nil {
+		return fmt.Errorf("frrtest: %w", err)
+	}
 
-	deadline := time.Now().Add(timeout)
-	for !fn() {
-		if time.Now().After(deadline) {
-			tb.Fatalf("timed out polling: %s", msg)
+	return nil
+}
+
+// poll implements Poll without the package prefix. It calls fn once
+// before waiting, so a condition which already holds returns without a
+// tick.
+func poll(ctx context.Context, fn func() error) error {
+	err := fn()
+	if err == nil {
+		return nil
+	}
+
+	tick := time.NewTicker(250 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("poll ended: %w: last error: %w", ctx.Err(), err)
+		case <-tick.C:
+			if err = fn(); err == nil {
+				return nil
+			}
 		}
-
-		time.Sleep(250 * time.Millisecond)
 	}
 }
 

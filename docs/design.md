@@ -234,9 +234,6 @@ type Oracle struct {
     // Hostname is the instance's kernel hostname, DefaultHostname when
     // empty.
     Hostname string
-
-    // Timeout bounds every poll, DefaultTimeout when zero.
-    Timeout time.Duration
 }
 
 // Addresses are the addresses on each end of the harness network.
@@ -249,10 +246,7 @@ type Addresses struct {
 // instance.
 func DefaultAddresses() Addresses
 
-const (
-    DefaultHostname = "frr-interop"
-    DefaultTimeout  = 60 * time.Second
-)
+const DefaultHostname = "frr-interop"
 
 // Main is the whole body of a consumer's TestMain. It never returns.
 func (o Oracle) Main(m *testing.M)
@@ -260,16 +254,19 @@ func (o Oracle) Main(m *testing.M)
 // Start starts an instance running the rendered configuration conf,
 // torn down when tb ends. It returns once every daemon accepts
 // configuration through vtysh; protocol readiness is the caller's poll.
-func (o Oracle) Start(tb testing.TB, conf []byte) *Instance
+// ctx bounds the wait for every daemon's vty socket before the
+// configuration load.
+func (o Oracle) Start(ctx context.Context, tb testing.TB, conf []byte) *Instance
 
 // Render executes the text/template at path with data.
 func (o Oracle) Render(tb testing.TB, path string, data any) []byte
 
-// Poll invokes fn every 250ms until it reports true, failing tb after
-// timeout. Polling an external process or the kernel is the documented
+// Poll invokes fn every 250ms until it returns nil, or until ctx ends,
+// which is the failure: the returned error wraps ctx.Err() and fn's last
+// error. Polling an external process or the kernel is the documented
 // exception to the no-sleep rule: neither state machine is ours to
 // synchronize on.
-func Poll(tb testing.TB, timeout time.Duration, msg string, fn func() bool)
+func Poll(ctx context.Context, fn func() error) error
 
 // An Instance is one running FRR instance.
 type Instance struct{ ... }
@@ -279,7 +276,8 @@ func (i *Instance) Addresses() Addresses
 func (i *Instance) Vtysh(cmds ...string) ([]byte, error)
 func (i *Instance) JSON(tb testing.TB, cmd string, v any) error
 func (i *Instance) Configure(tb testing.TB, lines ...string)
-func (i *Instance) Poll(tb testing.TB, msg string, fn func() bool)
+// Poll is Poll naming the instance in the error.
+func (i *Instance) Poll(ctx context.Context, fn func() error) error
 ```
 
 `Main` runs in the original process, before any namespace: when the env
@@ -302,7 +300,7 @@ gid 0 is the only one mapped; builds the `InstanceConfig` with tmpfs on
 and `/var/lib/frr` created, the veth from the oracle's names and
 addresses, and each daemon as `<dir>/<name> -u root -g root --vty_socket
 <run> -i /run/frr/<name>.pid -z /run/frr/zserv.api`; calls `netns.Start`;
-polls for every daemon's `.vty` socket; loads the config with `vtysh
+polls for every daemon's `.vty` socket within ctx; loads the config with `vtysh
 --vty_socket <run> --config_dir <etc> -f frr.conf`; and registers log
 saving. Log saving reads the instance's logs before the rig's cleanup
 tears it down, which cleanup's LIFO order gives when `Start` registers
@@ -317,10 +315,18 @@ commands and nested configuration lines work as they would
 interactively, and returns stdout with stderr appended on failure. `JSON`
 runs one command and unmarshals into v, which may be nil to discard the
 output. `Configure` prepends `configure terminal` and fails `tb` on
-error. `Poll` on an instance names the instance in the failure and uses
-the oracle's timeout; the package-level `Poll` is for the consumer's own
-waits outside any instance, such as isis polling the kernel for the host
-veth's link-local address.
+error. `Poll` calls fn once before waiting, so a condition which already
+holds returns without a tick, then selects on `ctx.Done()` and a ticker,
+so it stops as soon as ctx ends rather than sleeping past the deadline.
+It returns an error and fails nothing: the caller bounds the wait with
+`context.WithTimeout` or `t.Context()` and writes the failure message,
+as in `if err := f.Poll(ctx, fn); err != nil { t.Fatalf("isisd never
+answered vtysh: %v", err) }`. fn returns an error rather than a bool so
+the failure carries why the condition never held, such as vtysh's
+complaint. `Poll` on an instance names the instance in the error; the
+package-level `Poll` is for the consumer's own waits outside any
+instance, such as isis polling the kernel for the host veth's link-local
+address.
 
 Instance names are `<prefix>-<TestName>-<pid>` with every character
 outside `[A-Za-z0-9]` mapped to `-`, as `instanceName` does today.
@@ -380,7 +386,8 @@ show. The implementer keeps each one with its comment:
 
 ## Decisions
 
-Matt decided each of these on 2026-09-26 and 2026-09-27:
+Matt decided each of these on 2026-09-26 and 2026-09-27, except where a
+later date is given:
 
 - Two packages from the start: rig below, oracle above.
 - Parameterized by daemon list, env prefix, veth names, addresses with
@@ -407,3 +414,8 @@ Matt decided each of these on 2026-09-26 and 2026-09-27:
 - Templates, JSON views, await helpers, and the host side stay in the
   consumer.
 - Linux only at runtime; other platforms build and skip.
+- On 2026-10-23: polls are bounded by the caller's context, not a fixed
+  timeout. `Start` and both `Poll`s take a `context.Context`, `Poll`
+  returns an error wrapping `ctx.Err()` and fn's last error instead of
+  failing a `testing.TB`, and `Oracle.Timeout` and `DefaultTimeout`
+  are gone. fn returns an error, and polling stops when it returns nil.
